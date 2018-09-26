@@ -9,7 +9,7 @@ class Vocabulary(object):
     def __init__(self, args):
         self.filename = args.vocab_file
         with open(self.filename, encoding='utf-8') as fin:
-            header = fin.readline() # ignore header
+            header = fin.readline()  # ignore header
             self.lines = [x.split('\t')[0] for x in fin]
         self.str2id = tf.contrib.lookup.index_table_from_tensor(
             mapping=self.lines,
@@ -57,7 +57,7 @@ class InputPipeline(object):
                 'length': tf.shape(words)[0]
             }
 
-        inpt = self.args.input
+        inpt = self.input
         if inpt.endswith('.gz'):
             compression = 'GZIP'
         else:
@@ -66,7 +66,7 @@ class InputPipeline(object):
         pipe = tf.data.Dataset.list_files(inpt)
 
         pipe = pipe.repeat(self.args.epochs)
-        pipe = pipe.shuffle(50) # shuffle files
+        pipe = pipe.shuffle(50)  # shuffle files
 
         def _read_file(fn):
             return tf.data.TextLineDataset(
@@ -88,9 +88,11 @@ class InputPipeline(object):
             num_parallel_calls=self.args.parallel_map
         )
 
-    def __init__(self, args, vocab):
+    def __init__(self, args, input, batch_size, vocab):
         self.args = args
         self.vocab = vocab
+        self.input = input
+        self.batch_size = batch_size
         tf_records = args.tf_records
         if tf_records:
             pipe = self._tfrecords()
@@ -108,7 +110,7 @@ class InputPipeline(object):
             tf.contrib.data.bucket_by_sequence_length(
                 lambda x: x['length'],
                 bucket_boundaries=boundaries,
-                bucket_batch_sizes=self.make_batch_sizes(args.batch_size, boundaries),
+                bucket_batch_sizes=self.make_batch_sizes(batch_size, boundaries),
                 padded_shapes={
                     'length': [],
                     'data': [None]
@@ -189,8 +191,9 @@ class LanguageModel(object):
             )
 
             if args.lstm_size != args.embed_size:
-                self.output_layer = tf.keras.layers.Dense(
-                    units=args.embed_size
+                self.output_layer = tf.layers.Dense(
+                    units=args.embed_size,
+                    name="out_proj"
                 )
                 self.outputs = self.output_layer(self.rnn_out)
             else:
@@ -280,6 +283,39 @@ class Summaries(object):
         prj.visualize_embeddings(writer, cfg)
 
 
+class DevCalculator(object):
+    def __init__(self, args, idata):
+        self.idata = idata
+        self.model = LanguageModel(args, idata, True)
+        self.logits = tf.einsum('blk,nk->bln', self.model.outputs, self.model.embedding)
+        self.normalizer = tf.reduce_logsumexp(self.logits, axis=-1, keep_dims=True)
+        self.log_probs = self.logits - self.normalizer
+        self.probs = tf.exp(self.log_probs)
+        self.log2_probs = self.log_probs / tf.log(2.0)
+        self.entropy = -tf.reduce_sum(self.log2_probs * self.probs, axis=-1)
+        self.perplexity = tf.pow(2.0, self.entropy)
+        self.avg_perplexity = tf.reduce_mean(tf.boolean_mask(self.perplexity, self.model.mask))
+
+        self.pipeline = InputPipeline(args, args.dev_path, args.dev_batch, idata.vocab)
+        self.iterator = self.pipeline.pipe.make_initializable_iterator()
+
+        self.ppx_value = tf.placeholder(tf.float32, [])
+        self.ppx_summary = tf.summary.scalar("dev/ppx", self.ppx_value, [])
+
+    def run(self, sess, writer, step):
+        _, handle = sess.run([self.iterator.initializer, self.iterator.string_handle()])
+        feed_dict = {self.idata.handle: handle}
+        ppx = 0.0
+        cnt = 0
+        try:
+            while True:
+                ppx += sess.run(self.avg_perplexity, feed_dict=feed_dict)
+                cnt += 1
+        except tf.errors.OutOfRangeError:
+            summ = sess.run(self.ppx_summary, {self.ppx_value: ppx / cnt})
+            writer.add_summary(summ, step)
+
+
 class Runner(object):
     def __init__(self, args):
         self.args = args
@@ -304,7 +340,8 @@ class Runner(object):
         os.makedirs(args.snapshot_dir, exist_ok=True)
 
         self.save_path = args.snapshot_dir + "/snap"
-
+        if args.dev_path is not None:
+            self.dev = DevCalculator(args, self.idata)
 
     def train(self):
         try:
@@ -314,7 +351,7 @@ class Runner(object):
             self.saver.save(self.sess, self.save_path, global_step=self.model.cur_example)
 
     def _train(self):
-        idata = InputPipeline(self.args, self.vocab)
+        idata = InputPipeline(self.args, self.args.input, self.args.batch_size, self.vocab)
         iter = idata.pipe.make_initializable_iterator()
         iter_ref, _ = self.sess.run([iter.string_handle(), iter.initializer])
 
@@ -322,6 +359,7 @@ class Runner(object):
         prev_time = time.monotonic()
         summ_prev = prev_time
         snap_prev = prev_time
+        dev_prev = prev_time
 
         num_examples = 0
         step = 0
@@ -338,7 +376,7 @@ class Runner(object):
 
             if summ_eplaced > self.args.summary_freq:
                 nex = step - num_examples
-                feed_dict[self.summ.num_examples] = float(step - num_examples)
+                feed_dict[self.summ.num_examples] = float(nex)
                 feed_dict[self.summ.time_summaries] = summ_eplaced
                 fetches['summary'] = self.summ.train_summaries
                 # print(f"summary: processed {nex} examples in {summ_eplaced}: {nex/summ_eplaced} per sec")
@@ -356,6 +394,11 @@ class Runner(object):
             if (start_time - snap_prev) > self.args.snapshot_freq:
                 self.saver.save(self.sess, self.save_path, step)
                 snap_prev = start_time
+
+            if self.dev is not None and (start_time - dev_prev) > self.args.dev_freq:
+                print("Doing eval")
+                self.dev.run(self.sess, self.summ_wr, step)
+                dev_prev = start_time
 
 
 def parse_args():
@@ -375,6 +418,9 @@ def parse_args():
     p.add_argument('--tf_records', action='store_true')
     p.add_argument('--parallel_map', type=int, default=2)
     p.add_argument('--batch_size', type=int, default=1000)
+    p.add_argument('--dev-path')
+    p.add_argument('--dev-batch', type=int, default=1000)
+    p.add_argument('--dev-freq', type=float, default=10)
     return p.parse_args()
 
 
